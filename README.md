@@ -1,4 +1,4 @@
-# Draco
+# Dragon
 
 <div align="center" style="padding-top: 50px">
 <img src="/Resources/Dragon.png" />
