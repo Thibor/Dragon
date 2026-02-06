@@ -1301,10 +1301,8 @@ static int SearchAlpha(Position& pos, int alpha, const int beta, int depth, cons
 				stack);
 
 		// Exit early if out of time
-		if (info.stop) {
-			hash_count--;
-			return 0;
-		}
+		if (info.stop)
+			break;
 
 		if (score > best_score)
 			best_score = score;
@@ -1355,6 +1353,8 @@ static int SearchAlpha(Position& pos, int alpha, const int beta, int depth, cons
 			break;
 	}
 	hash_count--;
+	if (info.stop)
+		return 0;
 	if (best_score == -INF)
 		return in_check ? ply - MATE : 0;
 	tt_entry = { tt_key, best_move, tt_flag,S16(best_score), S16(!in_qsearch * depth) };
