@@ -1,7 +1,7 @@
 # Dragon
 
 <div align="center" style="padding-top: 50px">
-<img src="/Resources/Dragon.jpg" />
+<img src="/Resources/Dragon.png" />
     <br>
     <br>
     <b><i>Small uci chess engine 2600 elo.</i></b>
