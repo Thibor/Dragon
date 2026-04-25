@@ -115,12 +115,12 @@ static constexpr File operator~(File& f) {
 }
 
 struct Position {
-	bool flipped = false;
+	bool flipped;
 	int move50;
-	U64 castling[4]{};
-	U64 color[2]{};
-	U64 pieces[6]{};
-	U64 ep = 0x0ULL;
+	U8 castling[4];
+	U64 color[2];
+	U64 pieces[6];
+	U64 ep;
 };
 
 struct Move {
@@ -362,8 +362,9 @@ static void InitTT(int mb) {
 	TTClear();
 }
 
-static bool IsRepetition(U64 hash) {
-	for (int n = hash_count - 4; n >= 0; n -= 2)
+static bool IsRepetition(Position& pos, U64 hash) {
+	int limit = max(0, hash_count - pos.move50);
+	for (int n = hash_count - 4; n >= limit; n -= 2)
 		if (hash_history[n] == hash)
 			return true;
 	return false;
@@ -611,7 +612,9 @@ static auto MakeMove(Position& pos, const Move& move) {
 	const int captured = PieceTypeOn(pos, move.to);
 	const U64 to = 1ULL << move.to;
 	const U64 from = 1ULL << move.from;
-	pos.move50 = captured != PT_NB || piece == PAWN ? 0 : pos.move50++;
+	pos.move50++;
+	if(captured != PT_NB || piece == PAWN)
+		pos.move50 = 0;
 	pos.color[0] ^= from | to;
 	pos.pieces[piece] ^= from | to;
 	if (piece == PAWN && to == pos.ep) {
@@ -795,7 +798,7 @@ static bool IsPseudolegalMove(const Position& pos, const Move& move) {
 static void PrintPv(const Position& pos, const Move move) {
 	if (!IsPseudolegalMove(pos, move))
 		return;
-	auto npos = pos;
+	Position npos = pos;
 	if (!MakeMove(npos, move))
 		return;
 	cout << " " << MoveToUci(move, pos.flipped);
@@ -804,7 +807,7 @@ static void PrintPv(const Position& pos, const Move move) {
 	//if (tt_entry.key != tt_key || tt_entry.move == Move{} || tt_entry.flag != EXACT) {
 	if (tt_entry.key != tt_key || tt_entry.flag == LOWER)
 		return;
-	if (IsRepetition(tt_key))
+	if (IsRepetition(npos, tt_key))
 		return;
 	hash_history[hash_count++] = tt_key;
 	PrintPv(npos, tt_entry.move);
@@ -1180,7 +1183,7 @@ static int SearchAlpha(Position& pos, int alpha, int beta, int depth, const int 
 	const U64 tt_key = GetHash(pos);
 
 	if (ply && !in_qsearch)
-		if (pos.move50 >= 100 || IsRepetition(tt_key))
+		if (pos.move50 >= 100 || IsRepetition(pos, tt_key))
 			return 0;
 
 	// TT Probing
