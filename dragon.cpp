@@ -116,7 +116,7 @@ static constexpr File operator~(File& f) {
 
 struct Position {
 	bool flipped;
-	int move50;
+	U8 move50;
 	U8 castling[4];
 	U64 color[2];
 	U64 pieces[6];
@@ -132,33 +132,33 @@ struct Move {
 const Move no_move{};
 
 struct Stack {
+	S16 score;
+	S16 moves_scores[256];
 	Move moves[256];
 	Move moves_evaluated[256];
-	S64 moves_scores[256];
 	Move move;
 	Move killer;
-	S32 score;
 };
 
-struct TT_Entry {
+struct TTEntry {
+	U8 flag;
+	U8 depth;
+	S16 score;
 	U64 key;
 	Move move;
-	U8 flag;
-	S16 score;
-	S16 depth;
 };
 
-struct SSearchInfo {
+struct SearchInfo {
 	bool post = true;
 	bool stop = false;
-	int depthLimit = MAX_PLY;
+	U8 depthLimit = MAX_PLY;
 	S64 timeStart = 0;
 	S64 timeLimit = 0;
 	U64 nodes = 0;
 	U64 nodesLimit = 0;
 }info;
 
-struct SOptions {
+struct Options {
 	int elo = 2500;
 	int eloMin = 0;
 	int eloMax = 2500;
@@ -341,7 +341,7 @@ U64 bbAdjacentFiles[FILE_NB];
 U64 bbForwardRanks[RANK_NB];
 
 U64 tt_count = 64ULL << 15;
-vector<TT_Entry> tt;
+vector<TTEntry> tt;
 U64 keys[848];
 Stack stack[128]{};
 S32 hh_table[2][2][64][64]{};
@@ -353,11 +353,11 @@ U64 bbDistanceRing[64][8];
 void UciCommand(Position& pos, string command);
 
 static void TTClear() {
-	memset(tt.data(), 0, sizeof(TT_Entry) * tt.size());
+	memset(tt.data(), 0, sizeof(TTEntry) * tt.size());
 }
 
 static void InitTT(int mb) {
-	tt_count = (mb * 1000000) / sizeof(TT_Entry);
+	tt_count = (mb * 1000000) / sizeof(TTEntry);
 	tt.resize(tt_count);
 	TTClear();
 }
@@ -803,7 +803,7 @@ static void PrintPv(const Position& pos, const Move move) {
 		return;
 	cout << " " << MoveToUci(move, pos.flipped);
 	const U64 tt_key = GetHash(npos);
-	const TT_Entry& tt_entry = tt[tt_key % tt_count];
+	const TTEntry& tt_entry = tt[tt_key % tt_count];
 	//if (tt_entry.key != tt_key || tt_entry.move == Move{} || tt_entry.flag != EXACT) {
 	if (tt_entry.key != tt_key || tt_entry.flag == LOWER)
 		return;
@@ -1171,7 +1171,7 @@ static int SearchAlpha(Position& pos, int alpha, int beta, int depth, const int 
 	if (beta > mate_value - 1) beta = mate_value - 1;
 	if (alpha >= beta) return alpha;
 	int static_eval = EvalPosition(pos);
-	if (ply > 127)
+	if (ply >= MAX_PLY)
 		return static_eval;
 	stack[ply].score = static_eval;
 
@@ -1187,7 +1187,7 @@ static int SearchAlpha(Position& pos, int alpha, int beta, int depth, const int 
 			return 0;
 
 	// TT Probing
-	TT_Entry& tt_entry = tt[tt_key % tt_count];
+	TTEntry& tt_entry = tt[tt_key % tt_count];
 	Move tt_move{};
 	if (tt_entry.key == tt_key) {
 		tt_move = tt_entry.move;
@@ -1377,7 +1377,11 @@ static int SearchAlpha(Position& pos, int alpha, int beta, int depth, const int 
 		return 0;
 	if (best_score == -INF)
 		return in_check ? ply - MATE : 0;
-	tt_entry = { tt_key, best_move, tt_flag,S16(best_score), S16(!in_qsearch * depth) };
+	tt_entry.depth = max(0, depth);
+	tt_entry.flag = tt_flag;
+	tt_entry.score = best_score;
+	tt_entry.move = best_move;
+	tt_entry.key = tt_key;
 	return best_score;
 }
 
@@ -1458,7 +1462,7 @@ static void SetFen(Position& pos, const string& fen) {
 		FlipPosition(pos);
 }
 
-void PrintPerformanceHeader() {
+static void PrintPerformanceHeader() {
 	printf("-----------------------------\n");
 	printf("ply      time        nodes\n");
 	printf("-----------------------------\n");
@@ -1598,31 +1602,33 @@ static void ParseGo(Position& pos, string command) {
 	int time = pos.flipped ? btime : wtime;
 	int inc = pos.flipped ? binc : winc;
 	if (time)
-		info.timeLimit = min(time / movestogo + inc, time / 2);
+		info.timeLimit = max(1,min(time / movestogo + inc, time / 2));
 	SearchIteratively(pos);
 }
 
 void UciCommand(Position& pos, string command) {
 	if (command.empty())
 		return;
-	if (command == "uci")
+	stringstream ss(command);
+	string word;
+	ss >> word;
+	if (word == "uci")
 	{
 		cout << "id name " << NAME << endl;
 		cout << "option name UCI_Elo type spin default " << options.eloMax << " min " << options.eloMin << " max " << options.eloMax << endl;
 		cout << "option name hash type spin default " << options.ttMb << " min 1 max 1000" << endl;
 		cout << "uciok" << endl;
 	}
-	else if (command == "isready")
+	else if (word == "isready")
 		cout << "readyok" << endl;
-	else if (command == "ucinewgame")
+	else if (word == "ucinewgame")
 		memset(hh_table, 0, sizeof(hh_table));
-	else if (command.substr(0, 8) == "position")
+	else if (word == "position")
 		ParsePosition(pos, command);
-	else if (command.substr(0, 2) == "go")
+	else if (word == "go")
 		ParseGo(pos, command);
-	else if (command == "setoption")
+	else if (word == "setoption")
 	{
-		string word;
 		cin >> word;
 		cin >> word;
 		word = StrToLower(word);
@@ -1637,15 +1643,15 @@ void UciCommand(Position& pos, string command) {
 			InitTT(options.ttMb);
 		}
 	}
-	else if (command == "bench")
+	else if (word == "bench")
 		UciBench(pos);
-	else if (command == "perft")
+	else if (word == "perft")
 		UciPerformance(pos);
-	else if (command == "eval")
+	else if (word == "eval")
 		UciEval(pos);
-	else if (command == "print")
+	else if (word == "print")
 		PrintBoard(pos);
-	else if (command == "quit")
+	else if (word == "quit")
 		exit(0);
 }
 
@@ -1657,7 +1663,7 @@ static void UciLoop(Position& pos) {
 	}
 }
 
-void InitHash() {
+static void InitHash() {
 	mt19937_64 r;
 	for (U64& k : keys)
 		k = r();
