@@ -151,7 +151,7 @@ struct TTEntry {
 struct SearchInfo {
 	bool post = true;
 	bool stop = false;
-	U8 depthLimit = MAX_PLY;
+	int depthLimit = MAX_PLY;
 	S64 timeStart = 0;
 	S64 timeLimit = 0;
 	U64 nodes = 0;
@@ -172,7 +172,8 @@ static int S(const int mg, const int eg) {
 	return (eg << 16) + mg;
 }
 
-const int phases[] = { 0, 1, 1, 2, 4, 0 };
+const int phases[PT_NB] = { 0, 1, 1, 2, 4, 0 };
+const int insVal[PT_NB] = { 3, 1, 2, 3, 3, 0 };
 int material[PT_NB] = {};
 int max_material[PT_NB] = {};
 int outsideFile[PT_NB] = {};
@@ -949,7 +950,8 @@ static Value KingSafety(Position& pos, Square ksq) {
 static int EvalPosition(Position& pos) {
 	std::memset(scores, 0, sizeof(scores));
 	int score = tempo;
-	int ptCount[2][6] = {};
+	int ins[2]{};
+	int ptCount[2][PT_NB]{};
 	phase = 0;
 	for (int c = 0; c < 2; ++c) {
 		U64 bbAll = pos.color[0] | pos.color[1];
@@ -970,6 +972,7 @@ static int EvalPosition(Position& pos) {
 			U64 copy = pos.color[0] & pos.pieces[pt];
 			while (copy) {
 				phase += phases[pt];
+				ins[c] += insVal[pt];
 				ptCount[c][pt]++;
 				const Square sq = LSB(copy);
 				copy &= copy - 1;
@@ -1054,6 +1057,8 @@ static int EvalPosition(Position& pos) {
 		FlipPosition(pos);
 		score = -score;
 	}
+	if (ins[0] < 3 && ins[1] < 3)
+		return 0;
 	const int pieceCount[2][6] = {
   { ptCount[0][2] > 1,ptCount[0][0],ptCount[0][1],
 	ptCount[0][2],ptCount[0][3],ptCount[0][4]},
@@ -1063,6 +1068,7 @@ static int EvalPosition(Position& pos) {
 	int imbalanceEn = Imbalance(1, pieceCount);
 	int imbalance = (imbalanceUs - imbalanceEn) / 16;
 	score += S(imbalance, imbalance);
+	phase = min(24, phase);
 	score = (Mg(score) * phase + Eg(score) * (24 - phase)) / 24;
 	return (100 - pos.move50) * score / 100;
 }
@@ -1170,14 +1176,14 @@ static int SearchAlpha(Position& pos, int alpha, int beta, int depth, const int 
 	if (alpha < -mate_value) alpha = -mate_value;
 	if (beta > mate_value - 1) beta = mate_value - 1;
 	if (alpha >= beta) return alpha;
-	int static_eval = EvalPosition(pos);
+	int staticEval = EvalPosition(pos);
 	if (ply >= MAX_PLY)
-		return static_eval;
-	stack[ply].score = static_eval;
+		return staticEval;
+	stack[ply].score = staticEval;
 
 	// Check extensions
-	const S32 in_check = IsAttacked(pos, LSB(pos.color[0] & pos.pieces[KING]));
-	depth += in_check;
+	const S32 inCheck = IsAttacked(pos, LSB(pos.color[0] & pos.pieces[KING]));
+	depth += inCheck;
 
 	bool in_qsearch = depth <= 0;
 	const U64 tt_key = GetHash(pos);
@@ -1203,30 +1209,30 @@ static int SearchAlpha(Position& pos, int alpha, int beta, int depth, const int 
 	else
 		depth -= depth > 3;
 
-	const S32 improving = ply > 1 && static_eval > stack[ply - 2].score;
+	const S32 improving = ply > 1 && staticEval > stack[ply - 2].score;
 
 	// If static_eval > tt_entry.score, tt_entry.flag cannot be Lower (ie must be Upper or Exact).
 	// Otherwise, tt_entry.flag cannot be Upper (ie must be Lower or Exact).
-	if (tt_entry.key == tt_key && tt_entry.flag != static_eval > tt_entry.score)
-		static_eval = tt_entry.score;
+	if (tt_entry.key == tt_key && tt_entry.flag != staticEval > tt_entry.score)
+		staticEval = tt_entry.score;
 
-	if (in_qsearch && static_eval > alpha) {
-		if (static_eval >= beta)
-			return static_eval;
-		alpha = static_eval;
+	if (in_qsearch && staticEval > alpha) {
+		if (staticEval >= beta)
+			return staticEval;
+		alpha = staticEval;
 	}
 
-	if (ply > 0 && !in_qsearch && !in_check && alpha == beta - 1) {
+	if (ply && !in_qsearch && !inCheck && alpha == beta - 1) {
 		// Reverse futility pruning
 		if (depth < 8) {
-			if (static_eval - 71 * (depth - improving) >= beta)
-				return static_eval;
+			if (staticEval - 71 * (depth - improving) >= beta)
+				return staticEval;
 
-			in_qsearch = static_eval + 238 * depth < alpha;
+			in_qsearch = staticEval + 238 * depth < alpha;
 		}
 
 		// Null move pruning
-		if (depth > 2 && static_eval >= beta && static_eval >= stack[ply].score && do_null &&
+		if (depth > 2 && staticEval >= beta && staticEval >= stack[ply].score && do_null &&
 			pos.color[0] & ~pos.pieces[PAWN] & ~pos.pieces[KING]) {
 			Position npos = pos;
 			FlipPosition(npos);
@@ -1234,7 +1240,7 @@ static int SearchAlpha(Position& pos, int alpha, int beta, int depth, const int 
 			if (-SearchAlpha(npos,
 				-beta,
 				-alpha,
-				depth - 4 - depth / 5 - min((static_eval - beta) / 196, 3),
+				depth - 4 - depth / 5 - min((staticEval - beta) / 196, 3),
 				ply + 1,
 				stack,
 				false) >= beta)
@@ -1247,7 +1253,7 @@ static int SearchAlpha(Position& pos, int alpha, int beta, int depth, const int 
 
 	S32 num_moves_evaluated = 0;
 	S32 num_moves_quiets = 0;
-	S32 best_score = in_qsearch ? static_eval : -INF;
+	S32 best_score = in_qsearch ? staticEval : -INF;
 	auto best_move = tt_move;
 
 	auto& moves = stack[ply].moves;
@@ -1284,11 +1290,11 @@ static int SearchAlpha(Position& pos, int alpha, int beta, int depth, const int 
 		const S32 gain = max_material[move.promo] + max_material[PieceTypeOn(pos, move.to)];
 
 		// Delta pruning
-		if (in_qsearch && !in_check && static_eval + 50 + gain < alpha)
+		if (in_qsearch && !inCheck && staticEval + 50 + gain < alpha)
 			break;
 
 		// Forward futility pruning
-		if (ply > 0 && depth < 8 && !in_qsearch && !in_check && num_moves_evaluated && static_eval + 105 * depth + gain < alpha)
+		if (ply > 0 && depth < 8 && !in_qsearch && !inCheck && num_moves_evaluated && staticEval + 105 * depth + gain < alpha)
 			break;
 
 		Position npos = pos;
@@ -1369,14 +1375,14 @@ static int SearchAlpha(Position& pos, int alpha, int beta, int depth, const int 
 		moves_evaluated[num_moves_evaluated++] = move;
 		if (!gain)
 			num_moves_quiets++;
-		if (!in_check && alpha == beta - 1 && num_moves_quiets > (1 + depth * depth) >> (int)!improving)
+		if (!inCheck && alpha == beta - 1 && num_moves_quiets > (1 + depth * depth) >> (int)!improving)
 			break;
 	}
 	hash_count--;
 	if (info.stop)
 		return 0;
 	if (best_score == -INF)
-		return in_check ? ply - MATE : 0;
+		return inCheck ? ply - MATE : 0;
 	tt_entry.depth = max(0, depth);
 	tt_entry.flag = tt_flag;
 	tt_entry.score = best_score;
@@ -1564,8 +1570,8 @@ static void ParsePosition(Position& pos, string command) {
 		Move m = UciToMove(token, pos.flipped);
 		if (PieceTypeOn(pos, m.to) != PT_NB || PieceTypeOn(pos, m.from) == PAWN)
 			hash_count = 0;
-		MakeMove(pos, m);
 		hash_history[hash_count++] = GetHash(pos);
+		MakeMove(pos, m);
 	}
 }
 
