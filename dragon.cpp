@@ -2,6 +2,8 @@
 #include <sstream> 
 #include <random>
 
+#include <immintrin.h>
+
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
 #endif
@@ -356,8 +358,15 @@ Stack stack[128]{};
 S32 hh_table[2][2][SQ_NB][SQ_NB]{};
 int hash_count = 0;
 U64 hash_history[1024]{};
-int scores[TERM_NB][2];
 U64 bbDistanceRing[SQ_NB][8];
+
+U64 bishop_table[64][512];
+U64 rook_table[64][4096];
+U64 bishop_masks[64];
+U64 rook_masks[64];
+
+const int rook_deltas[4] = { 8, -8, 1, -1 };
+const int bishop_deltas[4] = { 9, -9, 7, -7 };
 
 void UciCommand(Position& pos, string command);
 
@@ -365,6 +374,7 @@ auto operator==(const Move& lhs, const Move& rhs) { return !memcmp(&rhs, &lhs, s
 
 static inline void TTClear() { memset(tt.data(), 0, sizeof(TTEntry) * tt.size()); }
 static inline void TTEvalClear() { memset(ttEval.data(), 0, sizeof(TTEntryEval) * ttEval.size()); }
+static inline U64 Count(const U64 bb) { return _mm_popcnt_u64(bb); }
 
 static void InitTT(int mb) {
 	int entrySize = sizeof(TTEntry) + sizeof(TTEntryEval);
@@ -376,6 +386,86 @@ static void InitTT(int mb) {
 	ttEval.resize(tt_count);
 	TTClear();
 	TTEvalClear();
+}
+
+static int IsValid(int square, int delta) {
+	int r = square / 8;
+	int c = square % 8;
+	int nr = (square + delta) / 8;
+	int nc = (square + delta) % 8;
+	if (nr < 0 || nr > 7 || nc < 0 || nc > 7) return 0;
+	if (delta == 1 || delta == -1) return r == nr;
+	if (delta == 9 || delta == -9 || delta == 7 || delta == -7) {
+		return (r - nr == 1 || r - nr == -1) && (c - nc == 1 || c - nc == -1);
+	}
+	return 1;
+}
+
+U64 GenerateSliderAttacks(int square, U64 occupancy, int is_rook) {
+	U64 attacks = 0ULL;
+	const int* deltas = is_rook ? rook_deltas : bishop_deltas;
+	for (int i = 0; i < 4; i++) {
+		int target = square;
+		while (IsValid(target, deltas[i])) {
+			target += deltas[i];
+			attacks |= (1ULL << target);
+			if (occupancy & (1ULL << target)) break;
+		}
+	}
+	return attacks;
+}
+
+void InitSlidersBmi2() {
+	for (int sq = 0; sq < 64; sq++) {
+		U64 bishop_mask = 0ULL;
+		for (int i = 0; i < 4; i++) {
+			int target = sq;
+			while (IsValid(target, bishop_deltas[i]) && IsValid(target + bishop_deltas[i], bishop_deltas[i])) {
+				target += bishop_deltas[i];
+				bishop_mask |= (1ULL << target);
+			}
+		}
+		bishop_masks[sq] = bishop_mask;
+
+		U64 rook_mask = 0ULL;
+		for (int i = 0; i < 4; i++) {
+			int target = sq;
+			while (IsValid(target, rook_deltas[i]) && IsValid(target + rook_deltas[i], rook_deltas[i])) {
+				target += rook_deltas[i];
+				rook_mask |= (1ULL << target);
+			}
+		}
+		rook_masks[sq] = rook_mask;
+
+		int bishop_bits = Count(bishop_mask);
+		int bishop_permutations = 1 << bishop_bits;
+		for (int i = 0; i < bishop_permutations; i++) {
+			U64 occupancy = _pdep_u64(i, bishop_mask);
+			U64 attacks = GenerateSliderAttacks(sq, occupancy, 0);
+			uint64_t index = _pext_u64(occupancy, bishop_mask);
+			bishop_table[sq][index] = attacks;
+		}
+
+		int rook_bits = Count(rook_mask);
+		int rook_permutations = 1 << rook_bits;
+		for (int i = 0; i < rook_permutations; i++) {
+			U64 occupancy = _pdep_u64(i, rook_mask);
+			U64 attacks = GenerateSliderAttacks(sq, occupancy, 1);
+
+			uint64_t index = _pext_u64(occupancy, rook_mask);
+			rook_table[sq][index] = attacks;
+		}
+	}
+}
+
+inline U64 BishopAttack(int square, U64 occupancy) {
+	U64 mask = bishop_masks[square];
+	return bishop_table[square][_pext_u64(occupancy, mask)];
+}
+
+inline U64 RookAttack(int square, U64 occupancy) {
+	U64 mask = rook_masks[square];
+	return rook_table[square][_pext_u64(occupancy, mask)];
 }
 
 static bool IsRepetition(Position& pos, U64 hash) {
@@ -404,10 +494,6 @@ inline static Square LSB(const U64 bb) {
 	return (Square)_tzcnt_u64(bb);
 }
 
-static U64 Count(const U64 bb) {
-	return _mm_popcnt_u64(bb);
-}
-
 static U64 East(const U64 bb) {
 	return (bb << 1) & ~0x0101010101010101ULL;
 }
@@ -424,27 +510,16 @@ static U64 South(const U64 bb) {
 	return bb >> 8;
 }
 
-static U64 NW(const U64 bb) {
-	return North(West(bb));
-}
+static inline U64 NW(const U64 bb) { return (bb << 7) & ~FileHBB; }
+static inline U64 NE(const U64 bb) { return (bb << 9) & ~FileABB; }
+static inline U64 SW(const U64 bb) { return (bb >> 9) & ~FileHBB; }
+static inline U64 SE(const U64 bb) { return (bb >> 7) & ~FileABB; }
 
-static U64 NE(const U64 bb) {
-	return North(East(bb));
-}
-
-static U64 SW(const U64 bb) {
-	return South(West(bb));
-}
-
-static U64 SE(const U64 bb) {
-	return South(East(bb));
-}
-
-U64 SpanSouth(U64 bb) {
+static U64 SpanSouth(U64 bb) {
 	return bb | bb >> 8 | bb >> 16 | bb >> 24 | bb >> 32;
 }
 
-U64 SpanNorth(U64 bb) {
+static U64 SpanNorth(U64 bb) {
 	return bb | bb << 8 | bb << 16 | bb << 24 | bb << 32;
 }
 
@@ -473,13 +548,6 @@ static int ValueMax(int score) {
 
 static bool MoreThanOne(U64 b) {
 	return b & (b - 1);
-}
-
-static int TotalScore(int c) {
-	int score = 0;
-	for (int n = 0; n < TERM_NB; n++)
-		score += scores[n][c];
-	return score;
 }
 
 static void FlipPosition(Position& pos) {
@@ -587,16 +655,8 @@ static U64 BBBishopAttack(const U64 bb, const U64 blockers) {
 	return Ray(bb, blockers, NW) | Ray(bb, blockers, NE) | Ray(bb, blockers, SW) | Ray(bb, blockers, SE);
 }
 
-static U64 BishopAttack(const int sq, const U64 blockers) {
-	return BBBishopAttack(bbSquare[sq], blockers);
-}
-
 static U64 BBRookAttack(const U64 bb, const U64 blockers) {
 	return Ray(bb, blockers, North) | Ray(bb, blockers, East) | Ray(bb, blockers, South) | Ray(bb, blockers, West);
-}
-
-static U64 RookAttack(const int sq, const U64 blockers) {
-	return BBRookAttack(bbSquare[sq], blockers);
 }
 
 static U64 BBKingAttack(const U64 bb) {
@@ -956,12 +1016,11 @@ static Value KingSafety(Position& pos, Square ksq) {
 }
 
 static int Eval(Position& pos) {
-	std::memset(scores, 0, sizeof(scores));
 	int score = tempo;
-	int ins[2]{};
-	int ptCount[2][PT_NB]{};
+	int insufficient[COLOR_NB]{};
+	int ptCount[COLOR_NB][PT_NB]{};
 	phase = 0;
-	for (int c = 0; c < 2; ++c) {
+	for (int c = 0; c < COLOR_NB; ++c) {
 		U64 bbAll = pos.color[0] | pos.color[1];
 		const U64 bbPawnsUs = pos.color[0] & pos.pieces[PAWN];
 		const U64 bbPawnsEn = pos.color[1] & pos.pieces[PAWN];
@@ -980,13 +1039,13 @@ static int Eval(Position& pos) {
 			U64 copy = pos.color[0] & pos.pieces[pt];
 			while (copy) {
 				phase += phases[pt];
-				ins[c] += insVal[pt];
+				insufficient[c] += insVal[pt];
 				ptCount[c][pt]++;
 				const Square sq = LSB(copy);
 				copy &= copy - 1;
 				const int rank = RankOf(sq);
 				const int file = FileOf(sq);
-				int score = bonus[pt][rank][file];
+				score += bonus[pt][rank][file];
 				const U64 bbSq = bbSquare[sq];
 				if (pt == PAWN) {
 					if (!(bbPawnsEn & bbPassedPawnMask[sq])) {
@@ -1000,7 +1059,7 @@ static int Eval(Position& pos) {
 							if (rank != RANK_7)
 								passed -= S(0, KingDistance(sqKUs, Square(sq2 + 8)) * w);
 						}
-						scores[PASSED][pos.flipped] += passed;
+						score += passed;
 					}
 					int structure = 0;
 					U64 opposed = bbPawnsEn & bbForward[WHITE][sq];
@@ -1017,13 +1076,13 @@ static int Eval(Position& pos) {
 							structure -= Backward;
 					if (doubled && !supported)
 						structure -= Doubled;
-					scores[STRUCTURE][pos.flipped] += structure;
+					score += structure;
 				}
 				else if (pt == KING) {
 					int minKingPawnDistance = 0;
 					if (bbPawnsUs)
 						while (!(bbDistanceRing[sq][++minKingPawnDistance] & bbPawnsUs)) {}
-					scores[pt][pos.flipped] += S(KingSafety(pos, sq), -16 * minKingPawnDistance);
+					score += S(KingSafety(pos, sq), -16 * minKingPawnDistance);
 				}
 				else {
 					U64 bbAttacks = Attacks(pt, sq, bbAll);
@@ -1048,21 +1107,17 @@ static int Eval(Position& pos) {
 						}
 					}
 				}
-				scores[pt][pos.flipped] += score;
 			}
 
 		}
-		score += TotalScore(pos.flipped);
 		FlipPosition(pos);
 		score = -score;
 	}
-	if (ins[0] < 3 && ins[1] < 3)
+	if (insufficient[0] < 3 && insufficient[1] < 3)
 		return 0;
 	const int pieceCount[2][6] = {
-  { ptCount[0][2] > 1,ptCount[0][0],ptCount[0][1],
-	ptCount[0][2],ptCount[0][3],ptCount[0][4]},
-	{ ptCount[1][2] > 1,ptCount[1][0],ptCount[1][1],
-	ptCount[1][2],ptCount[1][3],ptCount[1][4]} };
+	{ ptCount[0][2] > 1,ptCount[0][0],ptCount[0][1],ptCount[0][2],ptCount[0][3],ptCount[0][4]},
+	{ ptCount[1][2] > 1,ptCount[1][0],ptCount[1][1],ptCount[1][2],ptCount[1][3],ptCount[1][4]} };
 	int imbalanceUs = Imbalance(0, pieceCount);
 	int imbalanceEn = Imbalance(1, pieceCount);
 	int imbalance = (imbalanceUs - imbalanceEn) / 16;
@@ -1169,7 +1224,7 @@ static void InitEval() {
 			}
 }
 
-static int SearchAlpha(Position& pos, int alpha, int beta, int depth, const int ply, Stack* const stack, const bool do_null = true) {
+static int SearchAlpha(Position& pos, int alpha, int beta, int depth, const int ply, Stack* const stack, const bool doNull = true) {
 	if (CheckUp(pos))
 		return 0;
 	int  mate_value = MATE - ply;
@@ -1192,11 +1247,12 @@ static int SearchAlpha(Position& pos, int alpha, int beta, int depth, const int 
 			return 0;
 
 	// TT Probing
+	int inPv = beta - alpha > 1;
 	TTEntry& tt_entry = tt[hash & ttMask];
 	Move tt_move{};
 	if (tt_entry.key == hash) {
 		tt_move = tt_entry.move;
-		if (alpha == beta - 1 && tt_entry.depth >= depth) {
+		if (!inPv && tt_entry.depth >= depth) {
 			if (tt_entry.flag == EXACT)
 				return tt_entry.score;
 			if (tt_entry.flag == LOWER && tt_entry.score <= alpha)
@@ -1221,7 +1277,7 @@ static int SearchAlpha(Position& pos, int alpha, int beta, int depth, const int 
 		alpha = staticEval;
 	}
 
-	if (ply && !inQuiescence && !inCheck && alpha == beta - 1) {
+	if (ply && !inQuiescence && !inCheck && !inPv) {
 		// Reverse futility pruning
 		if (depth < 8) {
 			if (staticEval - 71 * (depth - improving) >= beta)
@@ -1231,11 +1287,11 @@ static int SearchAlpha(Position& pos, int alpha, int beta, int depth, const int 
 		}
 
 		// Null move pruning
-		if (depth > 2 && staticEval >= beta && staticEval >= stack[ply].score && do_null &&
+		if (depth > 2 && staticEval >= beta && staticEval >= stack[ply].score && doNull &&
 			pos.color[0] & ~pos.pieces[PAWN] & ~pos.pieces[KING]) {
 			Position npos = pos;
 			FlipPosition(npos);
-			npos.ep = 0;
+			npos.ep = 0ULL;
 			if (-SearchAlpha(npos,
 				-beta,
 				-alpha,
@@ -1511,38 +1567,6 @@ static int ScoreToValue(int score) {
 	return (mgWeight * Mg(score) + egWeight * Eg(score)) / 24;
 }
 
-static void PrintScore(int score) {
-	int v = ScoreToValue(score);
-	printf("%5d (%5d %5d)", v, Mg(score), Eg(score));
-}
-
-static void PrintTerm(string name, int idx) {
-	int sw = scores[idx][0];
-	int sb = scores[idx][1];
-	cout << name;
-	PrintScore(sw);
-	PrintScore(sb);
-	PrintScore(sw - sb);
-	cout << endl;
-}
-
-static void UciEval(Position& pos) {
-	PrintBoard(pos);
-	cout << "side " << (pos.flipped ? "black" : "white") << endl;
-	int score = Eval(pos);
-	printf("\n%s %11s %18s %18s\n", "Name", "White", "Black", "Total");
-	PrintTerm("Pawn      ", PAWN);
-	PrintTerm("Knight    ", KNIGHT);
-	PrintTerm("Bishop    ", BISHOP);
-	PrintTerm("Rook      ", ROOK);
-	PrintTerm("Queen     ", QUEEN);
-	PrintTerm("King      ", KING);
-	PrintTerm("Passed    ", PASSED);
-	PrintTerm("Structure ", STRUCTURE);
-	cout << "phase " << phase << endl;
-	cout << "score " << score << endl;
-}
-
 static void ParsePosition(Position& pos, string command) {
 	string fen = START_FEN;
 	stringstream ss(command);
@@ -1648,8 +1672,6 @@ void UciCommand(Position& pos, string command) {
 		UciBench(pos);
 	else if (token == "perft")
 		UciPerformance(pos);
-	else if (token == "eval")
-		UciEval(pos);
 	else if (token == "print")
 		PrintBoard(pos);
 	else if (token == "quit")
@@ -1704,6 +1726,7 @@ int main(const int argc, const char** argv) {
 	InitHash();
 	InitEval();
 	InitTT(options.ttMb);
+	InitSlidersBmi2();
 	cout << NAME << " " << VERSION << endl;
 	SetFen(pos, START_FEN);
 	UciLoop(pos);
