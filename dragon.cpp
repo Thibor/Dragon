@@ -1,7 +1,7 @@
 #include <iostream>
 #include <sstream> 
 #include <random>
-
+#include <string>
 #include <immintrin.h>
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -1654,17 +1654,17 @@ void UciCommand(Position& pos, string command) {
 		ParseGo(pos, command);
 	else if (token == "setoption")
 	{
-		cin >> token;
-		cin >> token;
+		ss >> token;
+		ss >> token;
 		token = StrToLower(token);
 		if (token == "uci_elo") {
-			cin >> token;
-			cin >> options.elo;
+			ss >> token;
+			ss >> options.elo;
 			InitEval();
 		}
 		else if (token == "hash") {
-			cin >> token;
-			cin >> options.ttMb;
+			ss >> token;
+			ss >> options.ttMb;
 			InitTT(options.ttMb);
 		}
 	}
